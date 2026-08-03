@@ -1,0 +1,597 @@
+# @saigontechnology/vision-camera-background-filter — full reference
+
+> Real-time selfie background replacement for react-native-vision-camera 5.
+> Concise index: ./llms.txt · Human docs: ./README.md
+> This file is the complete contract for assistants. Every claim here is checked against
+> the source in the same package; prefer it over inferring the API from call sites.
+
+## What this package does
+
+Three capabilities, probed independently because a device can have one without another:
+
+1. **Live preview** — a background composited into the camera preview in realtime,
+   entirely natively. No per-frame JS work; no segmentation mask crosses the bridge.
+2. **Record-time capture** — encodes the composited frames as they are previewed, then
+   remuxes the camera recorder's audio onto the result. The delivered file already has
+   the background.
+3. **Offline bake** — composites into an already-recorded file. The fallback for devices
+   that cannot capture, encoders that fail mid-take, and gallery imports.
+
+Native stack: iOS `VNGeneratePersonSegmentationRequest` + CoreImage `CIBlendWithMask` →
+`CAMetalLayer`; Android MLKit `segmentation-selfie` (bundled) + GLES2 shader.
+
+The package ships **ids, never copy**. No i18n, no theme, no navigation, no logging, no
+state library. Everything user-visible crosses the API boundary as an argument.
+
+## Compatibility
+
+| | Requirement |
+| --- | --- |
+| React Native | >=0.78, New Architecture ON (Nitro requires it) |
+| React | >=19 |
+| iOS | builds at 13; **segmentation requires 15+**, gated at runtime |
+| Android | minSdk 24, compileSdk 36, Kotlin |
+| Expo | SDK 53+, **dev build only — never Expo Go** |
+
+Required peers: `react-native-vision-camera` >=5.1, `react-native-vision-camera-worklets`
+>=5.1, `react-native-nitro-modules` >=0.36, `react-native-nitro-image` >=0.15,
+`react-native-worklets` >=0.10 (Software Mansion — NOT `react-native-worklets-core`).
+
+Optional peers: `expo-file-system` >=19 (for `/adapters/expo`), `expo-camera` >=17 (for
+`/surfaces/expo-camera`).
+
+No `@shopify/react-native-skia`. The live composite is native precisely so it can share
+one rasterizer per platform with the offline bake — which also keeps Skia's 25 MB/ABI
+`librnskia.so` out of the app.
+
+## Installation — Expo
+
+```bash
+npx expo install @saigontechnology/vision-camera-background-filter \
+  react-native-vision-camera react-native-vision-camera-worklets \
+  react-native-nitro-modules react-native-nitro-image react-native-worklets
+npx expo install expo-file-system expo-camera
+```
+
+`babel.config.js` — the worklets plugin must be LAST:
+
+```js
+module.exports = function (api) {
+  api.cache(true);
+  return {
+    presets: ['babel-preset-expo'],
+    plugins: ['react-native-worklets/plugin'],
+  };
+};
+```
+
+`app.config.ts` — permissions and SDK levels. This package ships NO config plugin, on
+purpose: `expo-camera`'s plugin is the single source of all three permission strings, and
+duplicating them produces conflicting Info.plist keys.
+
+```ts
+plugins: [
+  [
+    'expo-camera',
+    {
+      cameraPermission: 'Allow $(PRODUCT_NAME) to use your camera to record your video.',
+      microphonePermission: 'Allow $(PRODUCT_NAME) to use your microphone to record audio.',
+      recordAudioAndroid: true,
+    },
+  ],
+  [
+    'expo-build-properties',
+    {
+      android: { compileSdkVersion: 36, targetSdkVersion: 36, minSdkVersion: 24 },
+      ios: { deploymentTarget: '15.1' },
+    },
+  ],
+];
+```
+
+If NOT using `expo-camera`, write the keys yourself instead (never both):
+`ios.infoPlist.NSCameraUsageDescription`, `ios.infoPlist.NSMicrophoneUsageDescription`,
+`android.permissions: ['android.permission.CAMERA', 'android.permission.RECORD_AUDIO']`.
+
+Then: `npx expo prebuild --clean && npx expo run:ios` (or `run:android`). `--clean`
+matters on first install — autolinking discovers the module from its root podspec and
+`android/build.gradle`, and a stale native folder will not pick it up.
+
+## Installation — React Native (bare)
+
+```bash
+yarn add @saigontechnology/vision-camera-background-filter \
+  react-native-vision-camera react-native-vision-camera-worklets \
+  react-native-nitro-modules react-native-nitro-image react-native-worklets
+cd ios && pod install && cd ..
+```
+
+- `babel.config.js`: `plugins: ['react-native-worklets/plugin']`, last.
+- `android/build.gradle` → `ext { minSdkVersion = 24; compileSdkVersion = 36; targetSdkVersion = 36 }`
+- `android/gradle.properties` → `newArchEnabled=true`
+- `AndroidManifest.xml` → `CAMERA` + `RECORD_AUDIO` permissions
+- `Info.plist` → `NSCameraUsageDescription` + `NSMicrophoneUsageDescription`
+
+Autolinking needs nothing registered by hand.
+
+### Monorepo (Yarn workspaces)
+
+```js
+// metro.config.js
+config.watchFolders = [path.resolve(__dirname, 'packages')];
+config.resolver.nodeModulesPaths = [path.resolve(__dirname, 'node_modules')];
+config.resolver.extraNodeModules = {
+  react: path.resolve(__dirname, 'node_modules/react'),
+  'react-native': path.resolve(__dirname, 'node_modules/react-native'),
+};
+```
+
+Jest needs the subpaths mapped by hand (it does not read `exports` the way Metro does):
+
+```js
+moduleNameMapper: {
+  '^@saigontechnology/vision-camera-background-filter$':
+    '<rootDir>/packages/vision-camera-background-filter/src/index.ts',
+  '^@saigontechnology/vision-camera-background-filter/surfaces/expo-camera$':
+    '<rootDir>/packages/vision-camera-background-filter/src/surfaces/ExpoCameraSurface',
+  '^@saigontechnology/vision-camera-background-filter/(.*)$':
+    '<rootDir>/packages/vision-camera-background-filter/src/$1',
+},
+transformIgnorePatterns: [
+  // add: react-native-vision-camera|react-native-vision-camera-worklets|
+  //      react-native-nitro-modules|react-native-nitro-image
+],
+```
+
+Under Jest, mock `react-native-nitro-modules` (`hasHybridObject: () => false`) and
+`react-native-vision-camera` — VisionCamera creates HybridObjects at module load, so
+merely importing the barrel throws otherwise. With that mock the native probes report
+unsupported, which makes the "device cannot segment" branch the default in tests.
+
+## Verify before writing UI
+
+```ts
+import {
+  getSegmentationSupport,
+  isOfflineBakeSupported,
+} from '@saigontechnology/vision-camera-background-filter';
+
+getSegmentationSupport(); // { supported: true } when native is linked
+isOfflineBakeSupported(); // true
+```
+
+`{ supported: false, reason: 'no-model' }` on a device that should work almost always
+means the native module did not link. Rebuild; do not debug the JS.
+
+## Host capabilities (dependency injection)
+
+The record-time capture needs a scratch directory and a way to delete temp files. The
+package will not choose a filesystem library, so they cross as two functions.
+
+```ts
+interface BackgroundFilterFileSystem {
+  cacheDirectory: string | null; // PLAIN path, trailing slash, NO file:// scheme
+  deleteFile: (path: string) => void; // best-effort; must not throw or reject
+}
+
+interface BackgroundFilterHost {
+  fileSystem: BackgroundFilterFileSystem;
+  onWarn: (message: string, error?: unknown) => void;
+}
+```
+
+```ts
+// Expo
+configureBackgroundFilterHost(createExpoBackgroundFilterHost());
+
+// Bare / custom
+configureBackgroundFilterHost({
+  fileSystem: {
+    cacheDirectory: `${RNFS.CachesDirectoryPath}/`,
+    deleteFile: (p) => void RNFS.unlink(p).catch(() => {}),
+  },
+  onWarn: (message, error) => log.warn(message, error),
+});
+```
+
+- Call it once at startup, before any camera screen mounts.
+- Calls **merge** field by field, so `fileSystem` and `onWarn` can be wired from separate
+  places without one clobbering the other.
+- Per-mount override: the `host` prop on a camera surface. Pass a **stable reference** —
+  it is a memo dependency.
+- **Unconfigured is safe**: no cache directory → capture skipped → raw recording handed on
+  with `hasBackground: false` → your offline bake puts the background in. Slower, same
+  clip.
+- **Always wire `onWarn`.** Without it, a capture that failed and fell back is
+  indistinguishable from a device that never supported one.
+- `cacheDirectory` must be a plain path. Android's `MediaMuxer` rejects a `file://` URI
+  outright; the Expo adapter strips the scheme for you.
+
+## The camera surface contract
+
+```ts
+interface CameraRecording {
+  uri: string;
+  hasBackground: boolean; // describes the FILE, never the user's intent
+}
+
+interface CameraSurfaceHandle {
+  record: (maxDurationSec: number) => Promise<CameraRecording | undefined>;
+  stop: () => void; // safe when not recording and after the session is gone
+}
+
+interface CameraSurfaceProps {
+  facing: 'front' | 'back';
+  onReady: () => void;
+  style?: StyleProp<ViewStyle>;
+  backgroundId?: string; // undefined | 'none' = no filter
+  backgrounds?: readonly BackgroundSource[]; // REPLACES the bundled defaults
+  host?: Partial<BackgroundFilterHost>;
+}
+```
+
+Two implementations:
+
+- `VisionCameraSurface` (root export) — filtered, with record-time capture.
+- `ExpoCameraSurface` (`/surfaces/expo-camera`) — unfiltered fallback. Accepts and ignores
+  `backgroundId`/`backgrounds`, so the same props spread onto either.
+
+`record()` semantics:
+
+- **Resolves `CameraRecording`** — recording stopped normally (your `stop()` or
+  `maxDurationSec`).
+- **Resolves `undefined`** — the capture produced no usable file, e.g. the session was
+  torn down. NOT an error.
+- **Rejects** — a genuine capture failure. But on iOS, tearing down the session (the user
+  navigating back mid-record) also rejects, so track an `unmounted` ref and stay silent in
+  that case or you toast on whatever screen they landed on.
+
+## Complete integration
+
+```tsx
+import { useRef, useState } from 'react';
+import { StyleSheet, View, Button } from 'react-native';
+import {
+  BACKGROUND_NONE,
+  DEFAULT_BACKGROUNDS,
+  bakeFailureReason,
+  findBackground,
+  isBackgroundFilterAvailable,
+  isCancelledBakeError,
+  processVideoBackground,
+  shouldBakeBackground,
+  VisionCameraSurface,
+  type BackgroundSource,
+  type CameraSurfaceHandle,
+} from '@saigontechnology/vision-camera-background-filter';
+import { ExpoCameraSurface } from '@saigontechnology/vision-camera-background-filter/surfaces/expo-camera';
+
+const MY_BACKGROUNDS: BackgroundSource[] = [
+  ...DEFAULT_BACKGROUNDS,
+  { id: 'home', source: require('./assets/home.jpg') },
+];
+
+export function RecordScreen() {
+  const ref = useRef<CameraSurfaceHandle>(null);
+  const unmounted = useRef(false);
+  const [ready, setReady] = useState(false);
+  const [facing, setFacing] = useState<'front' | 'back'>('front');
+  const [backgroundId, setBackgroundId] = useState<string>(BACKGROUND_NONE);
+  const [pct, setPct] = useState<number | null>(null);
+
+  // ONCE per mount. Swapping mid-session tears down a live capture session.
+  const [available] = useState(() => isBackgroundFilterAvailable({ backgrounds: MY_BACKGROUNDS }));
+  const Surface = available ? VisionCameraSurface : ExpoCameraSurface;
+
+  useEffect(
+    () => () => {
+      unmounted.current = true;
+      ref.current?.stop(); // safe on a dead session
+    },
+    [],
+  );
+
+  const flip = () =>
+    setFacing((f) => {
+      const next = f === 'front' ? 'back' : 'front';
+      // Both models are tuned for front-facing selfies.
+      if (next === 'back') setBackgroundId(BACKGROUND_NONE);
+      return next;
+    });
+
+  const start = async () => {
+    try {
+      const result = await ref.current?.record(30);
+      if (unmounted.current || result == null) return; // torn down — not an error
+
+      // Branch on the FILE, never on `backgroundId`.
+      let uri = result.uri;
+      if (!result.hasBackground && shouldBakeBackground({ background: backgroundId })) {
+        const background = findBackground(MY_BACKGROUNDS, backgroundId);
+        if (background != null) {
+          const controller = new AbortController();
+          setPct(0);
+          try {
+            const baked = await processVideoBackground({
+              inputPath: uri, // trim FIRST if you trim at all
+              background,
+              fit: 'cover',
+              mirror: false, // recorded files are never mirrored
+              onProgress: (p) => setPct(Math.round(p * 100)),
+              signal: controller.signal,
+            });
+            uri = baked.outputPath;
+          } catch (e) {
+            if (isCancelledBakeError(e)) return; // the user's decision, not a failure
+            // A failed bake must ABORT the submit — uploading without the background
+            // the user recorded with reads as data loss.
+            throw new Error(COPY[bakeFailureReason(e)]);
+          } finally {
+            setPct(null);
+          }
+        }
+      }
+      await upload(uri);
+    } catch (e) {
+      if (unmounted.current) return; // the teardown we caused
+      showError(e);
+    }
+  };
+
+  return (
+    <View style={StyleSheet.absoluteFill}>
+      <Surface
+        ref={ref}
+        style={StyleSheet.absoluteFill}
+        facing={facing}
+        onReady={() => setReady(true)}
+        backgroundId={backgroundId}
+        backgrounds={MY_BACKGROUNDS}
+      />
+      {available && <BackgroundPicker value={backgroundId} onChange={setBackgroundId} />}
+      <Button title="Record" disabled={!ready} onPress={start} />
+      <Button title="Stop" onPress={() => ref.current?.stop()} />
+      <Button title="Flip" onPress={flip} />
+    </View>
+  );
+}
+
+const COPY = {
+  unsupported: 'This device cannot apply a background.',
+  cancelled: 'Cancelled.',
+  failed: 'Applying the background failed. Please try again.',
+};
+```
+
+## Composing it yourself (without the surfaces)
+
+```tsx
+const videoOutput = useVideoOutput({
+  enableAudio: true,
+  fileType: Platform.OS === 'ios' ? 'mov' : 'mp4', // see pitfall #4
+});
+
+const { frameOutput, renderer, support } = useBackgroundFilter({
+  effect: selectedId ? { kind: 'image', id: selectedId } : { kind: 'none' },
+  backgrounds: MY_BACKGROUNDS,
+  fit: 'cover',
+  mirror: false, // NEVER mirror the background
+  mirrorCamera: facing === 'front', // mirror the camera + mask together
+});
+
+<Camera
+  isActive
+  device={facing}
+  outputs={frameOutput != null ? [videoOutput, frameOutput] : [videoOutput]}
+  style={StyleSheet.absoluteFill}
+  onStarted={onReady}
+/>;
+{
+  /* Mount ONLY while filtering — with no frames it draws a blank rectangle over
+     the live preview instead of the camera. */
+}
+renderer != null && <BackgroundRendererView style={StyleSheet.absoluteFill} renderer={renderer} />;
+```
+
+Record-time capture, manually:
+
+```tsx
+// 1. Start the camera's recorder FIRST and await it. Order matters for lip sync.
+let started;
+const finished = new Promise((resolve, reject) => {
+  started = recorder.startRecording(resolve, reject);
+  started.catch(reject);
+});
+await started;
+
+// 2. Then start the composite encoder.
+const capture = isCompositeCaptureSupported(renderer)
+  ? startCompositeCapture({
+      renderer,
+      outputPath: `${cacheDir}composite-${Date.now()}.mp4`,
+      maxOutputHeight: 1920,
+      aspectRatio: 9 / 16, // match what the recorder writes
+    })
+  : null;
+
+// 3. Stop BOTH at the same instant (from your stop handler).
+recorder.stopRecording().catch(() => {});
+capture?.stop().catch(() => {});
+
+// 4. Join them. Neither track is re-encoded — ~1 s for a 30 s clip.
+const rawPath = await finished;
+const { outputPath, capturePath } = await capture.finish({ audioSourcePath: rawPath });
+deleteFile(capturePath); // both inputs are consumed by the mux
+deleteFile(rawPath);
+```
+
+## Full export list
+
+### Capability
+
+- `isBackgroundFilterAvailable(options?: { backgrounds? }): boolean` — assets ⋀ device
+  support. **Contains no feature flag by design**; `&&` your own for a staged rollout.
+- `getSegmentationSupport(): SegmentationSupport` — `{ supported, reason? }` where reason
+  is `'os-version' | 'no-model' | 'unsupported-device'`.
+- `useSegmentationSupport(): SegmentationSupport` — hook form.
+- `isCompositeCaptureSupported(renderer): boolean`
+- `isOfflineBakeSupported(): boolean`
+- `shouldBakeBackground(opts): boolean` — pure. Opts: `background`, `alreadyComposited?`,
+  `filterAvailable?`, `bakeSupported?`, `backgrounds?`. The last three are injectable so
+  the decision is testable without a device.
+
+### Surfaces
+
+- `VisionCameraSurface`, `ExpoCameraSurface` (subpath), types `CameraSurfaceHandle`,
+  `CameraRecording`, `CameraSurfaceProps`.
+
+### Live preview
+
+- `useBackgroundFilter(opts): { frameOutput, renderer, support }`
+  - `effect: { kind: 'image', id } | { kind: 'blur', radius } | { kind: 'none' }` —
+    **`blur` is plumbed through the type but NOT implemented**; it counts as inactive.
+  - `backgrounds?` — replaces the defaults.
+  - `fit?: 'cover' | 'contain'` (default `'cover'`)
+  - `mirror?: boolean` (default false) — mirrors the BACKGROUND. Leave false.
+  - `mirrorCamera?: boolean` (default false) — mirrors the camera + mask. Set true on the
+    front camera so the filtered preview matches the unfiltered one.
+  - `targetResolution?` (default `{ width: 960, height: 1280 }` — 4:3)
+  - `previewSizedFrames?: boolean` (default false)
+- `BackgroundRendererView` — `{ renderer, style }`.
+
+### Record & bake
+
+- `startCompositeCapture({ renderer, outputPath, maxOutputHeight?, aspectRatio? })`
+  → `CompositeCapture { capturePath, stop(), finish({ audioSourcePath?, outputPath? }), cancel() }`
+  - `stop()` is idempotent and returns the same path on repeat calls.
+  - `cancel()` resolves the partial path (delete it) or `null` if nothing was written.
+- `processVideoBackground({ inputPath, background, outputPath?, fit?, mirror?, maxOutputHeight?, onProgress?, signal? })`
+  → `Promise<{ outputPath, durationMs }>`
+  - `onProgress` is 0..1, throttled natively to ~10/s, called on the JS thread.
+  - A cancelled or failed run deletes its own partial output.
+
+### Backgrounds
+
+- `DEFAULT_BACKGROUNDS` (`office`, `studio`, `library`), `DEFAULT_BACKGROUND_IDS`,
+  `MAX_BACKGROUND_EDGE_PX` (1920)
+- `BACKGROUND_NONE` (`'none'`), `isBackgroundSelected(id)`,
+  `findBackground(list, id)` (generic in the element type — a widened
+  `BackgroundSource` comes back widened), `hasBackgrounds(list)`
+- `resolveBackgroundUri(background)`
+- `BackgroundSource = { id: string; source: number | { uri: string } }`
+
+### Errors
+
+- `BackgroundFilterError` with `code: 'unsupported' | 'decode-failed' | 'encode-failed' | 'cancelled' | 'io'`
+  — the only type the package rejects with. `isBackgroundFilterError(e)` guards it.
+- `bakeFailureReason(e) → 'unsupported' | 'cancelled' | 'failed'` — map to your own copy.
+  Anything unrecognised reports `'failed'`, so a future code cannot surface untranslated.
+- `BakeCancelledError` + `isBakeCancelled(e)` — the sentinel you throw to unwind a submit
+  pipeline after a user cancel.
+- `isCancelledBakeError(e)` — checks the PACKAGE's error, BEFORE conversion to the
+  sentinel. **Do not confuse these two.** Getting them backwards reclassifies every
+  genuine encoder failure as "you cancelled", which swallows the failure entirely.
+
+### Host
+
+`configureBackgroundFilterHost`, `resolveBackgroundFilterHost`, `useBackgroundFilterHost`,
+`resetBackgroundFilterHost` (test seam), `NULL_FILE_SYSTEM`, `optionalRequire`, types
+`BackgroundFilterHost`, `BackgroundFilterFileSystem`.
+
+### Geometry
+
+`computeBackgroundLayout`, `fitScale`, `mirrorRectHorizontally`, `rotateSize`,
+type `BackgroundLayout` — the single specification both native mirrors implement.
+
+## Pitfalls, with causes
+
+1. **Branching on the selected background instead of `result.hasBackground`.** A capture
+   that failed falls back to the raw recording and reports `false` even though a
+   background was picked. Branch on the selection and those clips upload unfiltered.
+2. **Treating `record() === undefined` as an error.** It means the session was torn down.
+   Only a rejection is a failure — and on iOS a teardown rejects too, so gate on an
+   `unmounted` ref.
+3. **Resolving the surface on every render.** Use `useState(() => …)`. Swapping surfaces
+   mid-session tears down a live capture session.
+4. **iOS clip has no audio.** `AVCaptureMovieFileOutput` writes a QuickTime container
+   regardless of what you ask for, so `fileType: 'mp4'` produces a QuickTime file NAMED
+   `.mp4`; `AVURLAsset` picks its parser from the extension and the mp4 parser silently
+   DISCARDS the QuickTime-style audio sample entry. Use `'mov'` on iOS, `'mp4'` on
+   Android (whose `MediaExtractor` sniffs content and whose muxer wants a real mp4).
+5. **Audio ~370 ms ahead of video.** The composite encoder takes t=0 from its first frame.
+   Start it before the recorder and the audio belongs to a moment the video does not have.
+   Start the recorder first, `await` its promise, then start the capture — the audio is
+   then LONGER at the head by exactly that gap, which `muxAudio` removes by comparing
+   durations.
+6. **Stopping the capture late.** Stop it at the same instant as the recorder, not when
+   the recorder's file arrives. The remux infers the head offset from the duration
+   difference; a loose tail corrupts that inference.
+7. **`pixelFormat: 'native'`.** Resolves to whatever the session negotiated, which on
+   Android can be a PRIVATE format with no CPU-accessible planes; a Galaxy S22 rejects it
+   outright (`PRIVATE format with resolution 1280x720 is not supported for
+   ImageAnalysis`). Use `'yuv'` — both renderers consume planar YUV directly.
+8. **`try { require('expo-file-system') }` to make a dep optional.** Metro resolves
+   `require` statically while building the module graph, so an uninstalled package is a
+   BUILD error and the catch never runs. Optionality comes from the subpath exports only.
+9. **Non-empty `react-native.config.js` platform entries.** Paths there resolve relative
+   to the package root, so an absolute `sourceDir`/`podspecPath` gets re-joined onto that
+   root, points nowhere, and the module vanishes from Android autolinking with NO error
+   (iOS keeps working, so it looks Android-specific). Keep both entries `{}`.
+10. **Oversized background images.** The native renderers downscale to 1920, but that does
+    not protect a thumbnail rendered through your own image loader. An 8192x5464 source
+    decodes to ~171 MB of RGBA → `RuntimeException: trying to draw too large bitmap` on
+    Android. Ship them near 1080x1920.
+11. **Mounting `BackgroundRendererView` when `renderer` is null.** It draws a blank
+    rectangle over the live preview instead of the camera.
+12. **Leaving `aspectRatio` at 0 on the capture.** The composited frames are shaped for
+    the PREVIEW (4:3, matching the unfiltered field of view) while the recorder writes
+    9:16, so a filtered clip comes out a different shape than an unfiltered one.
+13. **Full 1080p frames.** Measured on a Galaxy S22: 960x1280 → 28.7 fps; 1440x1920 →
+    22.2 fps, under the 24 fps budget on a flagship. iPhone 11 sits at 24.3–26.1 at
+    1440x1920, i.e. no margin.
+14. **`previewSizedFrames: true` while recording.** It caps the capture's resolution
+    (540x960 measured on an S22), because the capture encodes those same frames.
+15. **Expecting RN overlays in the file.** Teleprompters, countdowns and watermarks are
+    outside both composites. Intentional.
+16. **Baking a clip that already has a background.** `shouldBakeBackground` checks
+    `alreadyComposited` first for this reason — segmenting a composited frame composites
+    over the wrong subject, which looks far worse than not baking.
+17. **Treating `CameraRecording.uri` as a `file://` URI on Android.** It is a PLAIN
+    absolute path: VisionCamera's recorder returns `file.absolutePath`, and this
+    package's composite/mux output is schemeless deliberately because `MediaMuxer`
+    rejects a URI. media3/ExoPlayer routes a `null`-scheme `Uri` to `FileDataSource`, so
+    the clip PLAYS — but `expo-video`'s `generateThumbnailsAsync` gates on
+    `URLUtil.isFileUrl` (a literal `startsWith("file:")`), fails it, and hands the path
+    to the NETWORK overload of `setDataSource`, which throws. Symptom: video plays,
+    thumbnail strip is empty, Android only, so it looks like a thumbnail bug rather than
+    a URI-scheme one. Fix at the point of use:
+    `const toPlayerSource = (v) => (v.startsWith('/') ? 'file://' + v : v)` applied to
+    the PLAYER SOURCE ONLY. Keep the plain path for `processVideoBackground`, trimmers,
+    muxers and upload — prefixing globally breaks those instead.
+
+## Performance budget
+
+- Preview >=24 fps on iPhone 12 / Pixel 6 class. Measured ~30 fps on a Galaxy S22 at the
+  default resolution.
+- Bake: 0.3–1x realtime → 10–60 s for a 30 s clip. Needs progress UI and a cancel path.
+  Cap `maxOutputHeight` to 720 on slow devices if it exceeds ~60 s.
+- Remux: ~1 s for a 30 s clip (container operation, no re-encode).
+- Native size: ~700 KB per ABI, plus MLKit's bundled model (~5 MB, ABI-independent).
+
+## Architecture notes
+
+VisionCamera 5 splits the session into independent parallel outputs. Compositing in a
+`CameraFrameOutput` does NOT affect what `CameraVideoOutput` records, and
+`FrameRenderer.renderFrame(frame: Frame)` accepts only a VisionCamera `Frame` — so a
+composited image cannot be routed back into the `Recorder`. Hence the two paths above.
+
+Parity between the live composite and the offline bake is structural, not tested-in:
+`src/composite/geometry.ts` is the single specification for all fit/crop/mirror/rotation
+math, each platform has exactly ONE native mirror of it (`BackgroundGeometry.kt` /
+`.swift`) shared by that platform's live and offline paths, and `BackgroundGeometryTest.kt`
+asserts the Kotlin mirror produces the same numbers as the TypeScript. Do not add a third
+implementation.
+
+Audio is never captured, encoded or timed by this package. The camera's own recorder owns
+the microphone; the package takes its audio TRACK verbatim and puts it beside the
+composited video. That is why the A/V sync class of bug does not apply here.

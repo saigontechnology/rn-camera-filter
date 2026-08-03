@@ -1,0 +1,176 @@
+# @saigontechnology/vision-camera-background-filter
+
+> Real-time selfie background replacement for react-native-vision-camera 5, plus a
+> record-time capture that puts the background into the delivered file and an offline
+> bake as fallback. Segmentation and compositing are native (iOS Vision / Android MLKit);
+> no mask crosses into JS.
+> Full reference: ./llms-full.txt
+> Human docs: ./README.md
+
+React Native >=0.78 (New Architecture), React >=19, iOS 15+ to segment, Android minSdk 24
+/ compileSdk 36. **Does not run in Expo Go** — needs a dev build.
+
+## Install
+
+```bash
+npx expo install @saigontechnology/vision-camera-background-filter \
+  react-native-vision-camera react-native-vision-camera-worklets \
+  react-native-nitro-modules react-native-nitro-image react-native-worklets
+npx expo install expo-file-system expo-camera   # optional, recommended
+```
+
+1. `babel.config.js` → add `'react-native-worklets/plugin'` as the LAST plugin.
+2. Permissions come from `expo-camera`'s config plugin (`cameraPermission`,
+   `microphonePermission`, `recordAudioAndroid: true`). This package ships NO config
+   plugin. Do not also write the Info.plist keys by hand — that yields conflicting keys.
+3. `expo-build-properties` → `compileSdkVersion: 36`, `minSdkVersion: 24`,
+   iOS `deploymentTarget: '15.1'`.
+4. `npx expo prebuild --clean && npx expo run:ios`.
+5. Bare RN: `yarn add` the same peers, `pod install`, set `minSdkVersion`/
+   `compileSdkVersion` in `android/build.gradle`, add CAMERA + RECORD_AUDIO permissions.
+
+Verify the native side linked before writing UI:
+`getSegmentationSupport()` must return `{ supported: true }`. If it does not on a capable
+device, the module did not link — rebuild, do not debug JS.
+
+## Configure the host (once, at startup)
+
+The package does not choose a filesystem library. Supply two members before any camera
+screen mounts.
+
+```ts
+import { configureBackgroundFilterHost } from '@saigontechnology/vision-camera-background-filter';
+import { createExpoBackgroundFilterHost } from '@saigontechnology/vision-camera-background-filter/adapters/expo';
+
+configureBackgroundFilterHost(createExpoBackgroundFilterHost());
+```
+
+Non-Expo: `configureBackgroundFilterHost({ fileSystem: { cacheDirectory, deleteFile }, onWarn })`.
+`cacheDirectory` is a PLAIN PATH with a trailing slash and NO `file://` scheme — Android's
+MediaMuxer rejects a URI. Skipping this is safe: the capture is skipped and the offline
+bake takes over.
+
+## Canonical usage
+
+```tsx
+import {
+  BACKGROUND_NONE,
+  DEFAULT_BACKGROUNDS,
+  isBackgroundFilterAvailable,
+  VisionCameraSurface,
+  type CameraSurfaceHandle,
+} from '@saigontechnology/vision-camera-background-filter';
+import { ExpoCameraSurface } from '@saigontechnology/vision-camera-background-filter/surfaces/expo-camera';
+
+const ref = useRef<CameraSurfaceHandle>(null);
+const [backgroundId, setBackgroundId] = useState(BACKGROUND_NONE);
+
+// ONCE per mount — never on every render.
+const [available] = useState(() => isBackgroundFilterAvailable());
+const Surface = available ? VisionCameraSurface : ExpoCameraSurface;
+
+<Surface
+  ref={ref}
+  style={StyleSheet.absoluteFill}
+  facing="front"
+  onReady={() => setReady(true)}
+  backgroundId={backgroundId}
+  backgrounds={MY_BACKGROUNDS} // optional; REPLACES the bundled defaults
+/>;
+
+const result = await ref.current?.record(30); // resolves when recording stops
+if (result == null) return;                   // session torn down — NOT an error
+if (result.hasBackground) upload(result.uri); // background already in the pixels
+else upload(await bakeIfNeeded(result.uri, backgroundId));
+```
+
+Fallback bake for a clip that came back without its background:
+
+```tsx
+if (shouldBakeBackground({ background: backgroundId })) {
+  const { outputPath } = await processVideoBackground({
+    inputPath: trimmedUri,
+    background: findBackground(MY_BACKGROUNDS, backgroundId)!,
+    fit: 'cover',
+    mirror: false,
+    onProgress: (p) => setPct(Math.round(p * 100)),
+    signal: controller.signal,
+  });
+}
+```
+
+## Rules that are easy to get wrong
+
+1. Branch on `result.hasBackground`, NEVER on the user's selected background. A capture
+   that failed reports `false` even though a background was picked; that is what makes
+   the fallback safe. Branching on the selection uploads clips missing their background.
+2. `record()` resolving `undefined` means the session was torn down (user navigated away)
+   — not a failure. Only a rejection is. On iOS a teardown REJECTS, so check an
+   `unmounted` ref before showing an error.
+3. Resolve the surface component ONCE per mount (`useState(() => …)`). Swapping
+   mid-session tears down a live capture session.
+4. Do NOT wrap the optional deps in `try { require() }`. Metro resolves `require`
+   statically, so an uninstalled package is a BUILD error and the catch never runs.
+   Optionality comes from the subpath exports — import them or do not.
+5. Hide the background picker when `isBackgroundFilterAvailable()` is false.
+6. Trim before you bake. The bake runs 0.3–1x realtime (10–60 s for 30 s) and needs a
+   progress UI and a cancel path.
+7. A failed bake must ABORT the submit, not upload silently — that reads as data loss.
+   `isCancelledBakeError(e)` distinguishes a user cancel from a real failure.
+8. The background is never mirrored on either path. Set `mirrorCamera: facing === 'front'`,
+   leave `mirror: false`.
+9. Reset the background to `none` on flip to the rear camera — both models are tuned for
+   front-facing selfies.
+10. React Native overlays (teleprompter, countdown, watermark) are NOT composited into
+    the file. That is correct and intentional.
+11. `CameraRecording.uri` is a SCHEMELESS absolute path on Android (not `file://`).
+    ExoPlayer plays it fine, but `expo-video`'s `generateThumbnailsAsync` checks
+    `URLUtil.isFileUrl` (literally `startsWith("file:")`), fails, and falls through to
+    the NETWORK overload of `setDataSource` — the video plays and the thumbnail strip is
+    empty, on Android only. Prefix `file://` for the PLAYER only
+    (`v.startsWith('/') ? 'file://' + v : v`); keep the plain path for
+    `processVideoBackground`, trimmers, muxers and upload.
+
+## Key exports
+
+Capability: `isBackgroundFilterAvailable`, `getSegmentationSupport`,
+`useSegmentationSupport`, `isCompositeCaptureSupported`, `isOfflineBakeSupported`,
+`shouldBakeBackground`
+Surfaces: `VisionCameraSurface`, `ExpoCameraSurface` (subpath `/surfaces/expo-camera`),
+types `CameraSurfaceHandle`, `CameraRecording`, `CameraSurfaceProps`
+Live: `useBackgroundFilter`, `BackgroundRendererView`
+Record/bake: `startCompositeCapture`, `processVideoBackground`
+Backgrounds: `DEFAULT_BACKGROUNDS`, `BACKGROUND_NONE`, `findBackground`, `hasBackgrounds`,
+`isBackgroundSelected`, `resolveBackgroundUri`
+Errors: `BackgroundFilterError` (`code`: unsupported | decode-failed | encode-failed |
+cancelled | io), `bakeFailureReason`, `BakeCancelledError`, `isBakeCancelled`,
+`isCancelledBakeError`
+Host: `configureBackgroundFilterHost`, `resolveBackgroundFilterHost`,
+`useBackgroundFilterHost`, `resetBackgroundFilterHost`
+
+## Subpath exports
+
+- `.` — everything above. Needs only the required peers.
+- `./adapters/expo` — `createExpoBackgroundFilterHost`. Needs `expo-file-system`.
+- `./surfaces/expo-camera` — `ExpoCameraSurface`. Needs `expo-camera`.
+
+Importing a subpath is what pulls its dependency into the bundle. Skip the subpath and
+you do not need the dependency.
+
+## Top failure modes
+
+- `supported: false` on a capable device → native not linked → `prebuild --clean`, rebuild.
+- Android autolinking misses it, iOS fine → `react-native.config.js` platform entries must
+  stay EMPTY; paths there resolve relative to the package root and silently point nowhere.
+- `PRIVATE format … not supported for ImageAnalysis` → use `pixelFormat: 'yuv'`, not
+  `'native'`.
+- iOS clip has no audio → record as `.mov` on iOS, not `.mp4`. AVCaptureMovieFileOutput
+  always writes QuickTime; the mp4 parser then discards the audio track.
+- Audio ~370 ms ahead → start the camera recorder FIRST and await it, then the capture.
+- Filtered clip is a different shape than an unfiltered one → pass `aspectRatio` (e.g.
+  `9/16`) to `startCompositeCapture`.
+- Android `trying to draw too large bitmap` → background images must be near 1080x1920;
+  the native downscale does not protect your own thumbnails.
+- Capture never runs, always bakes → no `cacheDirectory` configured. Wire `onWarn` to see.
+- Android video plays but the expo-video thumbnail strip is empty (iOS fine) → the uri is
+  schemeless; prefix `file://` for the player only. See rule 11.

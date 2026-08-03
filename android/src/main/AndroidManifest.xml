@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!--
+    No permissions declared on purpose. Camera and microphone permissions are the
+    host app's to own (this repo declares them via its expo-camera plugin block),
+    and duplicating them here would produce conflicting manifest entries.
+  -->
+</manifest>

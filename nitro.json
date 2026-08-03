@@ -1,0 +1,44 @@
+{
+  "$schema": "https://nitro.margelo.com/nitro.schema.json",
+  "cxxNamespace": ["backgroundfilter"],
+  "ios": {
+    "iosModuleName": "VisionCameraBackgroundFilter"
+  },
+  "android": {
+    "androidNamespace": ["backgroundfilter"],
+    "androidCxxLibName": "VisionCameraBackgroundFilter"
+  },
+  "autolinking": {
+    "BackgroundRenderer": {
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "HybridBackgroundRenderer"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "HybridBackgroundRenderer"
+      }
+    },
+    "BackgroundRendererView": {
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "HybridBackgroundRendererView"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "HybridBackgroundRendererView"
+      }
+    },
+    "OfflineVideoProcessor": {
+      "ios": {
+        "language": "swift",
+        "implementationClassName": "HybridOfflineVideoProcessor"
+      },
+      "android": {
+        "language": "kotlin",
+        "implementationClassName": "HybridOfflineVideoProcessor"
+      }
+    }
+  },
+  "ignorePaths": ["**/node_modules", "**/lib"]
+}

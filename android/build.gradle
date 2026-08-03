@@ -1,0 +1,127 @@
+buildscript {
+  repositories {
+    google()
+    mavenCentral()
+  }
+}
+
+def reactNativeArchitectures() {
+  def value = rootProject.getProperties().get("reactNativeArchitectures")
+  return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
+}
+
+apply plugin: "com.android.library"
+apply plugin: "org.jetbrains.kotlin.android"
+// Adds the nitrogen-generated Kotlin sources to this project's sourceSets.
+apply from: '../nitrogen/generated/android/VisionCameraBackgroundFilter+autolinking.gradle'
+
+def getExtOrDefault(name, defaultValue) {
+  return rootProject.ext.has(name) ? rootProject.ext.get(name) : defaultValue
+}
+
+android {
+  namespace "com.saigontechnology.backgroundfilter"
+
+  compileSdkVersion getExtOrDefault("compileSdkVersion", 36)
+
+  defaultConfig {
+    // MLKit selfie segmentation requires API 21+; the app's floor is already
+    // higher, so this is not a constraint in practice.
+    minSdkVersion getExtOrDefault("minSdkVersion", 24)
+
+    externalNativeBuild {
+      cmake {
+        cppFlags "-frtti -fexceptions -Wall -Wextra -fstack-protector-all"
+        arguments "-DANDROID_STL=c++_shared", "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+        abiFilters(*reactNativeArchitectures())
+
+        buildTypes {
+          debug {
+            cppFlags "-O1 -g"
+          }
+          release {
+            cppFlags "-O2"
+          }
+        }
+      }
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+    }
+  }
+
+  // These .so files are provided by the app or by other libraries at runtime —
+  // packaging our own copies would produce duplicate-library conflicts.
+  packagingOptions {
+    excludes = [
+      "META-INF",
+      "META-INF/**",
+      "**/libc++_shared.so",
+      "**/libNitroModules.so",
+      "**/libVisionCamera.so",
+      "**/libfbjni.so",
+      "**/libjsi.so",
+      "**/libreactnative.so",
+      "**/libhermes.so",
+    ]
+  }
+
+  buildFeatures {
+    buildConfig false
+    prefab true
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  kotlin {
+    jvmToolchain(17)
+  }
+
+  sourceSets {
+    main {
+      java.srcDirs += ["src/main/java"]
+    }
+  }
+}
+
+repositories {
+  google()
+  mavenCentral()
+}
+
+dependencies {
+  // JVM unit tests. `BackgroundGeometry` is pure math with no Android dependencies,
+  // which is exactly why it can be tested here — and it must be, since it is a
+  // hand-maintained mirror of `composite/geometry.ts` with nothing else enforcing
+  // that the two agree.
+  testImplementation "junit:junit:4.13.2"
+
+  implementation "com.facebook.react:react-android"
+  implementation "org.jetbrains.kotlin:kotlin-stdlib"
+
+  // Nitro core — required by the generated HybridObject bindings.
+  implementation project(":react-native-nitro-modules")
+
+  // VisionCamera — the generated BackgroundRenderer spec takes a
+  // `com.margelo.nitro.camera.HybridFrameSpec`, and the renderer casts it to
+  // VisionCamera's public `NativeFrame` interface to reach the ImageProxy.
+  implementation project(":react-native-vision-camera")
+
+  // CameraX. VisionCamera declares these as `implementation`, so they do NOT leak
+  // onto our compile classpath transitively — but `NativeFrame.image` is an
+  // `ImageProxy`, so we need camera-core directly. Version pinned to match
+  // VisionCamera's to avoid two CameraX versions on the runtime classpath.
+  implementation "androidx.camera:camera-core:1.7.0-alpha02"
+
+  // MLKit selfie segmentation. This artifact is BUNDLED-only — the model ships
+  // inside the APK, so there is no first-run download to stall on and no
+  // "download the model" toggle to expose. It is also the bulk of this module's
+  // size contribution (~5 MB).
+  implementation "com.google.mlkit:segmentation-selfie:16.0.0-beta6"
+}

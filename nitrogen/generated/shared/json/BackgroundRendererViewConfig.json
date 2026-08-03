@@ -1,0 +1,10 @@
+{
+  "uiViewClassName": "BackgroundRendererView",
+  "supportsRawText": false,
+  "bubblingEventTypes": {},
+  "directEventTypes": {},
+  "validAttributes": {
+    "renderer": true,
+    "hybridRef": true
+  }
+}

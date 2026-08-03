@@ -1,0 +1,14 @@
+# Build output
+lib/
+android/build/
+android/.cxx/
+# Gradle daemon caches — machine-local locks and file hashes, never committed.
+android/.gradle/
+ios/build/
+
+# Nitro codegen output is generated, but IS committed (see task 3b) — consumers
+# build from it without running nitrogen. Nothing to ignore there.
+
+# OS / editor
+.DS_Store
+*.tsbuildinfo
