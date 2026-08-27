@@ -119,19 +119,6 @@ final class HybridBackgroundRenderer: HybridBackgroundRendererSpec, NativeSurfac
     )
     let source = CIImage(cvPixelBuffer: pixelBuffer).oriented(cgOrientation)
 
-    // TEMPORARY diagnostic — remove before merging. The rear camera's filtered
-    // preview comes out rotated 180° against the unfiltered one while the front
-    // camera is correct, and the same code path serves both, so the only input that
-    // can differ is what arrives here. Logs once per change, not per frame.
-    Self.logOrientationOnce(
-      orientation: frame.orientation,
-      isMirrored: frame.isMirrored,
-      cameraMirrored: cameraMirrored,
-      cgOrientation: cgOrientation,
-      rawExtent: CIImage(cvPixelBuffer: pixelBuffer).extent,
-      orientedExtent: source.extent
-    )
-
     // The SAME orientation goes to Vision, so the mask comes back in the corrected
     // space and lines up with `source`. Passing `.up` here (as this did) also gave
     // the model a sideways person to segment.
@@ -337,28 +324,6 @@ final class HybridBackgroundRenderer: HybridBackgroundRendererSpec, NativeSurfac
     }
   }
 
-  /// TEMPORARY diagnostic — remove before merging. See the call site in `renderFrame`.
-  private static var lastOrientationSignature: String?
-  private static func logOrientationOnce(
-    orientation: CameraOrientation,
-    isMirrored: Bool,
-    cameraMirrored: Bool,
-    cgOrientation: CGImagePropertyOrientation,
-    rawExtent: CGRect,
-    orientedExtent: CGRect
-  ) {
-    let signature = """
-    [BackgroundFilter] frame.orientation=\(orientation) frame.isMirrored=\(isMirrored) \
-    cameraMirrored=\(cameraMirrored) -> cgOrientation=\(cgOrientation.rawValue) \
-    (expect 6 on BOTH cameras in portrait) \
-    mirrorFrame=\(cameraMirrored != isMirrored) \
-    raw=\(Int(rawExtent.width))x\(Int(rawExtent.height)) \
-    oriented=\(Int(orientedExtent.width))x\(Int(orientedExtent.height))
-    """
-    guard signature != lastOrientationSignature else { return }
-    lastOrientationSignature = signature
-    NSLog("%@", signature)
-  }
 
 }
 

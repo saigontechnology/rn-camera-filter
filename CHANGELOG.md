@@ -292,6 +292,28 @@ a file — the offline bake had never executed either. Both ran, in the same ses
 
 ### Fixed
 
+- **Android: a camera session killed by device policy never came back.** Locking or
+  powering the phone down while a filtered camera screen was open, then returning to
+  it, left the preview black until the screen was navigated away from and back.
+
+  `ERROR_CAMERA_DISABLED` is a **CRITICAL** CameraX error, and only RECOVERABLE ones
+  are retried by the camera stack — `ActiveCameraSessionSingle.updateCameraState`
+  hands criticals straight to `onError` (the reported stack trace lands on the
+  `CameraState.ErrorType.CRITICAL` branch). Nothing here handled that, so the session
+  stayed dead. Returning to the app while the device is still finishing an unlock is
+  enough to hit it: the policy has not released the camera yet, the freshly-mounted
+  session dies, and there was no second attempt.
+
+  `VisionCameraSurface` now retries on a session error, remounting `<Camera>` under a
+  new key — the only thing that rebinds a session the stack has given up on; toggling
+  `isActive` does not. Bounded to 4 attempts 700 ms apart, so a transient lock
+  recovers while a genuinely disabled camera (an MDM policy) does not spin. The
+  counter resets on a successful start, so each outage gets a full budget.
+
+  Unfiltered cameras appeared to recover from this because there is no compositing
+  overlay in front of them: `BackgroundRendererView` is opaque and draws only when
+  frames arrive, so a dead session reads as black rather than as a stalled preview.
+
 - **iOS: the rear camera's filtered preview was rotated 180°.** The renderer
   counter-rotated each buffer by `frame.orientation`, on the premise — stated in a
   comment, and wrong — that this describes how the delivered pixels are rotated. It

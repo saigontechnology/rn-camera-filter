@@ -1,4 +1,12 @@
-import React, { forwardRef, useImperativeHandle, useMemo, useRef } from 'react';
+import React, {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import { Platform, StyleSheet, View } from 'react-native';
 
@@ -55,6 +63,23 @@ import type { Recorder } from 'react-native-vision-camera';
  */
 const RECORDING_ASPECT_RATIO = 9 / 16;
 
+/**
+ * How long to wait before rebuilding a session that died, and how many times.
+ *
+ * A CRITICAL CameraX error is NOT retried by the camera stack — only RECOVERABLE
+ * ones are (`ActiveCameraSessionSingle.updateCameraState` hands criticals straight
+ * to `onError`). The one that matters in practice is `ERROR_CAMERA_DISABLED`:
+ * returning to the app while the device is still finishing an unlock hits a camera
+ * the device policy has not released yet, the session dies critically, and without
+ * a retry the preview stays dead for as long as the screen is open.
+ *
+ * The delay exists because retrying instantly just hits the same policy. Attempts
+ * are bounded so a genuinely disabled camera (an MDM policy, not a transient lock)
+ * does not spin forever.
+ */
+const SESSION_RETRY_DELAY_MS = 700;
+const SESSION_RETRY_LIMIT = 4;
+
 /** Joins a directory and a filename without doubling or dropping the separator. */
 const joinPath = (directory: string, name: string): string =>
   directory.endsWith('/') ? `${directory}${name}` : `${directory}/${name}`;
@@ -108,6 +133,46 @@ export const VisionCameraSurface = forwardRef<CameraSurfaceHandle, CameraSurface
       // on flips the subject left-to-right. The recorded file stays unmirrored.
       mirrorCamera: facing === 'front',
     });
+
+    // ─── Session recovery ─────────────────────────────────────────────────────
+    //
+    // Remounting `<Camera>` under a new key is what rebuilds a dead session: there
+    // is no "reopen" call, and flipping `isActive` does not rebind a session the
+    // camera stack has already given up on.
+    const [sessionAttempt, setSessionAttempt] = useState(0);
+    const retriesRef = useRef(0);
+    const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    // A started session means the camera is healthy again, so the next failure gets
+    // a full budget rather than inheriting the last outage's.
+    const handleStarted = useCallback(() => {
+      retriesRef.current = 0;
+      onReady?.();
+    }, [onReady]);
+
+    const handleError = useCallback(
+      (error: Error) => {
+        onWarn('the camera session failed', error);
+        if (retriesRef.current >= SESSION_RETRY_LIMIT) return;
+        if (retryTimerRef.current != null) return;
+        retriesRef.current += 1;
+        retryTimerRef.current = setTimeout(() => {
+          retryTimerRef.current = null;
+          setSessionAttempt((attempt) => attempt + 1);
+        }, SESSION_RETRY_DELAY_MS);
+      },
+      [onWarn],
+    );
+
+    // A pending retry that fires after unmount would setState on a dead component,
+    // and the session it would rebuild has no view left to draw into.
+    useEffect(
+      () => () => {
+        if (retryTimerRef.current != null) clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      },
+      [],
+    );
 
     const recorderRef = useRef<Recorder | null>(null);
     /**
@@ -262,11 +327,15 @@ export const VisionCameraSurface = forwardRef<CameraSurfaceHandle, CameraSurface
     return (
       <View style={style ?? StyleSheet.absoluteFill}>
         <Camera
+          // Remounts on retry — see `handleError`. Included in the key rather than
+          // toggled as a prop because only a fresh mount rebinds the session.
+          key={sessionAttempt}
           isActive
           device={facing}
           outputs={outputs}
           style={StyleSheet.absoluteFill}
-          onStarted={onReady}
+          onStarted={handleStarted}
+          onError={handleError}
         />
         {/* Mounted only while filtering: with no frames arriving it would draw a
             blank rectangle over the live preview instead of the camera. */}
