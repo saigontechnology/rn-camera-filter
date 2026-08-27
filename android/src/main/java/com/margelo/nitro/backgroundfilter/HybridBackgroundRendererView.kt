@@ -1,5 +1,6 @@
 package com.margelo.nitro.backgroundfilter
 
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -13,6 +14,11 @@ import com.saigontechnology.backgroundfilter.NativeSurfaceRenderer
  * starts without waiting on layout) or the surface may exist before a renderer is
  * assigned, so both `renderer`'s setter and the surface callbacks have to be able
  * to complete the connection — whichever happens second wins.
+ *
+ * The renderer is a singleton shared with every other instance of this view, so
+ * this class hands its own [connectedSurface] back on the way out rather than
+ * asking the renderer to disconnect whatever it happens to be using. See
+ * [NativeSurfaceRenderer.disconnectSurface] for what that protects against.
  */
 class HybridBackgroundRendererView(
   val context: ThemedReactContext,
@@ -20,6 +26,14 @@ class HybridBackgroundRendererView(
   SurfaceHolder.Callback {
 
   private val surfaceView = SurfaceView(context)
+
+  /**
+   * The surface this view last handed to the renderer, or null if it never did (or
+   * has already given it up). Held rather than re-read from the holder because a
+   * `SurfaceHolder` keeps returning its `Surface` after the window is gone, and the
+   * point of tracking it is to know what THIS view is responsible for.
+   */
+  private var connectedSurface: Surface? = null
 
   override val view: View
     get() = surfaceView
@@ -39,9 +53,10 @@ class HybridBackgroundRendererView(
     surfaceView.holder.addCallback(this)
   }
 
+
   override var renderer: HybridBackgroundRendererSpec? = null
     set(value) {
-      (field as? NativeSurfaceRenderer)?.disconnectSurface()
+      releaseConnection(field)
       field = value
       connect()
     }
@@ -51,26 +66,42 @@ class HybridBackgroundRendererView(
     val holder = surfaceView.holder
     // `isCreating` is true between surfaceCreated and the first surfaceChanged,
     // when the surface exists but its size is not final yet.
-    if (!holder.surface.isValid) return
+    if (!holder.surface.isValid) {
+      return
+    }
     val frame = holder.surfaceFrame
+    connectedSurface = holder.surface
     nativeRenderer.connectSurface(holder.surface, frame.width(), frame.height())
   }
 
-  override fun surfaceCreated(holder: SurfaceHolder) = connect()
+  /**
+   * Hands this view's surface back, if it still holds one. Safe to call repeatedly,
+   * and safe when [target] is a renderer this view never connected to.
+   */
+  private fun releaseConnection(target: HybridBackgroundRendererSpec?) {
+    val surface = connectedSurface ?: return
+    connectedSurface = null
+    (target as? NativeSurfaceRenderer)?.disconnectSurface(surface)
+  }
+
+  override fun surfaceCreated(holder: SurfaceHolder) {
+    connect()
+  }
 
   override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
     val nativeRenderer = renderer as? NativeSurfaceRenderer ?: return
+    connectedSurface = holder.surface
     nativeRenderer.connectSurface(holder.surface, width, height)
   }
 
   override fun surfaceDestroyed(holder: SurfaceHolder) {
-    (renderer as? NativeSurfaceRenderer)?.disconnectSurface()
+    releaseConnection(renderer)
   }
 
   override fun dispose() {
     super.dispose()
     surfaceView.holder.removeCallback(this)
-    (renderer as? NativeSurfaceRenderer)?.disconnectSurface()
+    releaseConnection(renderer)
     renderer = null
   }
 }

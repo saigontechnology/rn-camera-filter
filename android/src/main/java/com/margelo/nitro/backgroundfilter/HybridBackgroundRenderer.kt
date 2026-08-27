@@ -1,7 +1,6 @@
 package com.margelo.nitro.backgroundfilter
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.media.Image
 import android.view.Surface
 import androidx.annotation.OptIn
@@ -10,6 +9,7 @@ import com.margelo.nitro.camera.HybridFrameSpec
 import com.margelo.nitro.camera.`public`.NativeFrame
 import com.margelo.nitro.core.Promise
 import com.saigontechnology.backgroundfilter.BackgroundFitMode
+import com.saigontechnology.backgroundfilter.BackgroundImageLoader
 import com.saigontechnology.backgroundfilter.capture.CompositeVideoRecorder
 import com.saigontechnology.backgroundfilter.BackgroundGeometry
 import com.saigontechnology.backgroundfilter.NativeSurfaceRenderer
@@ -17,8 +17,6 @@ import com.saigontechnology.backgroundfilter.SegmentationQuality
 import com.saigontechnology.backgroundfilter.SelfieSegmenter
 import com.saigontechnology.backgroundfilter.gl.CompositeGl
 import com.saigontechnology.backgroundfilter.gl.EglCore
-import java.io.File
-import java.net.URL
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -42,14 +40,6 @@ class HybridBackgroundRenderer :
   HybridBackgroundRendererSpec(),
   NativeSurfaceRenderer {
 
-  private companion object {
-    /**
-     * Mirrors `MAX_BACKGROUND_EDGE_PX` in `src/assets/background/index.ts`.
-     * Duplicated because native cannot read the TS constant; keep them in step.
-     */
-    const val MAX_BACKGROUND_EDGE_PX = 1920
-  }
-
   private val segmenter = SelfieSegmenter(SegmentationQuality.BALANCED)
   private val egl = EglCore()
   private val composite = CompositeGl()
@@ -57,6 +47,12 @@ class HybridBackgroundRenderer :
   private var isGlReady = false
   private var viewportWidth = 0
   private var viewportHeight = 0
+
+  /**
+   * The surface currently being drawn into, so a superseded view cannot disconnect
+   * its successor's. Compared by IDENTITY — see [disconnectSurface].
+   */
+  private var connectedSurface: Surface? = null
 
   /** Set from JS, consumed on the render thread on the next frame. */
   @Volatile
@@ -129,6 +125,7 @@ class HybridBackgroundRenderer :
     pendingBackground = PendingBackground(uri, mode, mirror)
   }
 
+
   override fun setCameraMirrored(mirrored: Boolean) {
     cameraMirrored = mirrored
   }
@@ -200,6 +197,19 @@ class HybridBackgroundRenderer :
     // the frame rather than drawing into nothing.
     if (!egl.makeCurrent()) return
 
+    try {
+      drawFrame(frame, nativeFrame, image)
+    } finally {
+      // NEVER leave the context bound to this thread. It belongs to VisionCamera's
+      // per-output executor, which is never shut down, so it outlives this screen —
+      // and a context still current on it makes `makeCurrent` fail with
+      // EGL_BAD_ACCESS on the next screen's frame thread, permanently. See
+      // EglCore.releaseCurrent.
+      egl.releaseCurrent()
+    }
+  }
+
+  private fun drawFrame(frame: HybridFrameSpec, nativeFrame: NativeFrame, image: Image) {
     applyPendingBackground()
 
     if (!isGlReady) {
@@ -453,60 +463,41 @@ class HybridBackgroundRenderer :
   }
 
   /**
-   * Decodes a background, downscaled to at most [MAX_BACKGROUND_EDGE_PX] on its
-   * longest edge.
+   * Decodes a background via the shared loader, which is also what the offline bake
+   * uses — the two MUST agree on the pixels, and on which URI forms they accept.
    *
-   * The downscale is not an optimisation, it is a correctness requirement. The
-   * package's own bundled images go up to 8192x5464, which would decode to ~171 MB
-   * of RGBA — an OOM on mid-range devices — and exceed the 4096px
-   * `GL_MAX_TEXTURE_SIZE` that many GPUs report, making the texture upload fail
-   * outright. Consumers can inject arbitrary images, so this cannot rely on assets
-   * being well-sized.
-   *
-   * Supports the URI forms the JS side can produce: a `file://`/absolute path in
-   * release, and an `http://` Metro URL in dev.
-   *
-   * Returns null on any failure — the renderer then passes the camera frame
-   * through instead of showing a broken composite, and never logs.
+   * Returns null on any failure: the renderer then passes the camera frame through
+   * instead of showing a broken composite, and never logs.
    */
-  private fun decode(uri: String): Bitmap? =
-    try {
-      // Two passes: measure, then decode subsampled. `inSampleSize` only honours
-      // powers of two, so this lands at or below the cap, never above it.
-      val bytes = readBytes(uri)
-      val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-      BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-
-      val longest = maxOf(bounds.outWidth, bounds.outHeight)
-      var sampleSize = 1
-      while (longest / sampleSize > MAX_BACKGROUND_EDGE_PX) {
-        sampleSize *= 2
-      }
-
-      val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-      BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-    } catch (_: Throwable) {
-      null
-    }
-
-  private fun readBytes(uri: String): ByteArray =
-    when {
-      uri.startsWith("http://") || uri.startsWith("https://") ->
-        URL(uri).openStream().use { it.readBytes() }
-      uri.startsWith("file://") -> File(java.net.URI(uri)).readBytes()
-      else -> File(uri).readBytes()
-    }
+  private fun decode(uri: String): Bitmap? = BackgroundImageLoader.load(uri)
 
   override fun connectSurface(surface: Surface, width: Int, height: Int) {
     viewportWidth = width
     viewportHeight = height
+    connectedSurface = surface
     egl.createWindowSurface(surface)
     // The old context's GL objects died with it; rebuild on the next frame.
     isGlReady = false
     composite.clearBackground()
   }
 
-  override fun disconnectSurface() {
+  /**
+   * Ignores a surface that is no longer the connected one — see
+   * [NativeSurfaceRenderer.disconnectSurface].
+   *
+   * This renderer is a singleton shared by every `BackgroundRendererView` in the
+   * app, and two of them are alive at once whenever one camera screen is pushed
+   * over another (a router keeps the screen underneath mounted). Their surface
+   * callbacks interleave: the arriving view's `surfaceCreated` lands BEFORE the
+   * departing view's `surfaceDestroyed`/`dispose`, so an unconditional release
+   * destroyed the surface that had just been connected. `renderFrame` then returned
+   * at its `hasSurface` guard forever after, because nothing left on screen would
+   * ever fire another surface callback — the filter died on navigation and only an
+   * app restart brought it back.
+   */
+  override fun disconnectSurface(surface: Surface) {
+    if (connectedSurface !== surface) return
+    connectedSurface = null
     egl.releaseSurface()
   }
 
@@ -522,6 +513,7 @@ class HybridBackgroundRenderer :
     captureFinisher.shutdownNow()
     if (isGlReady) composite.release()
     isGlReady = false
+    connectedSurface = null
     egl.release()
     backgroundBitmap?.recycle()
     backgroundBitmap = null

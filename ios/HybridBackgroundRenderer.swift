@@ -103,11 +103,34 @@ final class HybridBackgroundRenderer: HybridBackgroundRendererSpec, NativeSurfac
 
     // Camera buffers arrive in SENSOR orientation, not display orientation — on a
     // portrait iPhone the sensor is landscape, so drawing the buffer as-is renders
-    // the preview rotated 90°. `frame.orientation` states how the pixel data is
-    // rotated relative to upright and it is the consumer's job to counter-rotate;
-    // this was the "flipped 90° to the left" bug.
-    let cgOrientation = Self.cgOrientation(for: frame.orientation)
+    // the preview rotated 90°; it is the consumer's job to counter-rotate, and not
+    // doing so was the "flipped 90° to the left" bug.
+    //
+    // `frame.orientation` is what to counter-rotate BY, but it does not describe the
+    // buffer — this comment used to claim it did, and that premise is what left the
+    // rear camera upside down for a release. It is the connection's output
+    // convention, and it differs by 180° between the two cameras; see
+    // `cgOrientation(for:isFrontCamera:)`. `cameraMirrored` doubles as "the front
+    // camera is open", which is what the consumer is asked to report (see the spec
+    // for `setCameraMirrored`), so it is what the rear camera is normalised against.
+    let cgOrientation = Self.cgOrientation(
+      for: frame.orientation,
+      isFrontCamera: cameraMirrored
+    )
     let source = CIImage(cvPixelBuffer: pixelBuffer).oriented(cgOrientation)
+
+    // TEMPORARY diagnostic — remove before merging. The rear camera's filtered
+    // preview comes out rotated 180° against the unfiltered one while the front
+    // camera is correct, and the same code path serves both, so the only input that
+    // can differ is what arrives here. Logs once per change, not per frame.
+    Self.logOrientationOnce(
+      orientation: frame.orientation,
+      isMirrored: frame.isMirrored,
+      cameraMirrored: cameraMirrored,
+      cgOrientation: cgOrientation,
+      rawExtent: CIImage(cvPixelBuffer: pixelBuffer).extent,
+      orientedExtent: source.extent
+    )
 
     // The SAME orientation goes to Vision, so the mask comes back in the corrected
     // space and lines up with `source`. Passing `.up` here (as this did) also gave
@@ -246,14 +269,18 @@ final class HybridBackgroundRenderer: HybridBackgroundRendererSpec, NativeSurfac
 
   /**
    * Maps VisionCamera's `CameraOrientation` to the `CGImagePropertyOrientation`
-   * that corrects it.
+   * that corrects the delivered buffer.
    *
-   * The names line up one-to-one — this is the same mapping VisionCamera itself
-   * uses in `CG+CameraOrientation.swift`, reimplemented because that extension is
-   * internal to the VisionCamera module and not visible here.
+   * The names line up one-to-one with VisionCamera's own mapping in
+   * `CG+CameraOrientation.swift`, reimplemented because that extension is internal
+   * to the VisionCamera module — but the value it is given is normalised first, which
+   * VisionCamera's version does not do. See the body.
    *
    * Mirroring is deliberately NOT folded in here (no `.leftMirrored` etc.) — it is
-   * applied in the compositor instead, so the mask is flipped with the frame.
+   * applied in the compositor instead, so the mask is flipped with the frame. That
+   * decomposition is exact rather than approximate: `flipH ∘ rot90CCW` is the
+   * transpose, i.e. `.leftMirrored`, and `flipH ∘ rot90CW` is the transverse, i.e.
+   * `.rightMirrored`. Folding mirroring in would change nothing.
    *
    * ⚠️ This used to claim "the front camera's buffer already arrives mirrored, so
    * leaving it alone keeps the preview mirror-like". That assumption was **wrong on
@@ -263,14 +290,74 @@ final class HybridBackgroundRenderer: HybridBackgroundRendererSpec, NativeSurfac
    * `setCameraMirrored`. The background stays unmirrored in both the live and offline
    * paths, so only the person is mirrored — as on the `expo-camera` path.
    */
-  private static func cgOrientation(for orientation: CameraOrientation) -> CGImagePropertyOrientation {
-    switch orientation {
+  private static func cgOrientation(
+    for orientation: CameraOrientation,
+    isFrontCamera: Bool
+  ) -> CGImagePropertyOrientation {
+    // ─── Why the rear camera is turned through 180° ───
+    //
+    // `frame.orientation` is `AVCaptureConnection.videoOrientation` read back
+    // (VisionCamera's `AVCaptureConnection+orientation.swift`). That is the
+    // connection's OUTPUT convention, not a description of the buffer that was
+    // delivered — and AVFoundation's default differs by 180° between the two
+    // cameras, because the front camera's convention has its mirrored mount baked
+    // in. Measured on a portrait iPhone, same device orientation, both cameras:
+    //
+    //   front: orientation .right, isMirrored false, buffer 1920x1080
+    //   rear:  orientation .left,  isMirrored false, buffer 1920x1080
+    //
+    // Identical buffers, values 180° apart. So they cannot both be counter-rotated
+    // by their own reported value: the front comes out upright and the rear upside
+    // down, which is exactly the reported defect. The buffers agree, so the
+    // correction must too — normalise onto the front camera's value, which is the
+    // one that renders upright.
+    //
+    // Adding 180° (rather than inverting) is what closes the measured gap: `.left`
+    // and `.right` are 180° apart, as are `.up` and `.down`, so this generalises to
+    // a rotating host instead of only holding in portrait.
+    let corrected = isFrontCamera ? orientation : turnedThrough180(orientation)
+    switch corrected {
     case .up: return .up
     case .down: return .down
     case .left: return .left
     case .right: return .right
     default: return .up
     }
+  }
+
+  /// `CameraOrientation` turned through 180°: `.left`/`.right` are opposites, and so
+  /// are `.up`/`.down`.
+  private static func turnedThrough180(_ orientation: CameraOrientation) -> CameraOrientation {
+    switch orientation {
+    case .up: return .down
+    case .down: return .up
+    case .left: return .right
+    case .right: return .left
+    default: return orientation
+    }
+  }
+
+  /// TEMPORARY diagnostic — remove before merging. See the call site in `renderFrame`.
+  private static var lastOrientationSignature: String?
+  private static func logOrientationOnce(
+    orientation: CameraOrientation,
+    isMirrored: Bool,
+    cameraMirrored: Bool,
+    cgOrientation: CGImagePropertyOrientation,
+    rawExtent: CGRect,
+    orientedExtent: CGRect
+  ) {
+    let signature = """
+    [BackgroundFilter] frame.orientation=\(orientation) frame.isMirrored=\(isMirrored) \
+    cameraMirrored=\(cameraMirrored) -> cgOrientation=\(cgOrientation.rawValue) \
+    (expect 6 on BOTH cameras in portrait) \
+    mirrorFrame=\(cameraMirrored != isMirrored) \
+    raw=\(Int(rawExtent.width))x\(Int(rawExtent.height)) \
+    oriented=\(Int(orientedExtent.width))x\(Int(orientedExtent.height))
+    """
+    guard signature != lastOrientationSignature else { return }
+    lastOrientationSignature = signature
+    NSLog("%@", signature)
   }
 
 }

@@ -55,7 +55,6 @@ class OfflineVideoProcessor(
     private const val I_FRAME_INTERVAL = 1
     /** Matches the app's own upload target so the bake does not undo it. */
     private const val BITRATE_FALLBACK = 3_000_000
-    private const val MAX_BACKGROUND_EDGE_PX = 1920
   }
 
   class ProcessingError(message: String) : Exception(message)
@@ -328,26 +327,11 @@ class OfflineVideoProcessor(
   }
 
   /**
-   * Decodes the background, downscaled — same cap and the same reason as the live
-   * renderer: the bundled images reach 8192px, past many GPUs' texture limit.
+   * Decodes the background via the shared loader — the same one the live renderer
+   * uses, so the bake and the preview cannot disagree about the pixels or about
+   * which URI forms they accept.
    */
-  private fun decodeBackground(uri: String): Bitmap? =
-    runCatching {
-      val bytes = when {
-        uri.startsWith("http://") || uri.startsWith("https://") ->
-          java.net.URL(uri).openStream().use { it.readBytes() }
-        uri.startsWith("file://") -> File(java.net.URI(uri)).readBytes()
-        else -> File(uri).readBytes()
-      }
-      val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-      android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-      var sample = 1
-      while (maxOf(bounds.outWidth, bounds.outHeight) / sample > MAX_BACKGROUND_EDGE_PX) sample *= 2
-      android.graphics.BitmapFactory.decodeByteArray(
-        bytes, 0, bytes.size,
-        android.graphics.BitmapFactory.Options().apply { inSampleSize = sample },
-      )
-    }.getOrNull()
+  private fun decodeBackground(uri: String): Bitmap? = BackgroundImageLoader.load(uri)
 
   /** Fits [width]x[height] under [cap] on the long edge, rounded to even dimensions. */
   private fun scaleToCap(width: Int, height: Int, cap: Int): Pair<Int, Int> {

@@ -156,6 +156,33 @@ class EglCore {
     return EGL14.eglSwapBuffers(display, target)
   }
 
+  /**
+   * Unbinds the context from the calling thread, leaving it bound to nobody.
+   *
+   * **The drawing thread must call this when it finishes a frame.** An EGL context
+   * can be current on at most ONE thread, and `eglMakeCurrent` from a second thread
+   * fails with `EGL_BAD_ACCESS` while the first still holds it — it does not steal
+   * the binding.
+   *
+   * That is fatal here, because the drawing thread is not ours and does not last:
+   * VisionCamera gives every `CameraFrameOutput` its own single-thread executor
+   * (`HybridFrameOutput` constructs an `IdentifiableExecutor` per instance) and its
+   * `dispose()` only clears the analyzer — the executor is never shut down, so the
+   * thread lives on, idle, for the life of the process. Leave the context bound to
+   * it and the next camera screen's frame thread can never bind: every
+   * [makeCurrent] returns false, `renderFrame` drops every frame at that guard, and
+   * the filter is dead until the process restarts.
+   *
+   * Costs one extra `eglMakeCurrent` per frame, which also defeats [bind]'s
+   * short-circuit. That is the price of not owning the thread we draw on.
+   */
+  fun releaseCurrent() {
+    if (display == EGL14.EGL_NO_DISPLAY) return
+    EGL14.eglMakeCurrent(
+      display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT,
+    )
+  }
+
   fun releaseSurface() {
     if (surface != EGL14.EGL_NO_SURFACE) {
       EGL14.eglDestroySurface(display, surface)

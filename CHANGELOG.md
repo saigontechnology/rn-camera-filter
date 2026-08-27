@@ -292,6 +292,86 @@ a file — the offline bake had never executed either. Both ran, in the same ses
 
 ### Fixed
 
+- **iOS: the rear camera's filtered preview was rotated 180°.** The renderer
+  counter-rotated each buffer by `frame.orientation`, on the premise — stated in a
+  comment, and wrong — that this describes how the delivered pixels are rotated. It
+  is `AVCaptureConnection.videoOrientation` read back: the connection's OUTPUT
+  convention, whose AVFoundation default differs by 180° between the two cameras
+  because the front camera's convention has its mirrored mount baked in. Measured on
+  a portrait iPhone, same device orientation:
+
+  | camera | `frame.orientation` | `isMirrored` | buffer      | result       |
+  | ------ | ------------------- | ------------ | ----------- | ------------ |
+  | front  | `.right`            | `false`      | 1920x1080   | upright      |
+  | rear   | `.left`             | `false`      | 1920x1080   | upside down  |
+
+  Identical buffers, corrections 180° apart — so they could not both be right.
+  `cgOrientation` now turns the value through 180° unless the front camera is open,
+  normalising onto the front's convention (the one that renders upright).
+  `cameraMirrored` is the front-camera signal: reporting which camera is open is
+  already what the consumer is asked to do, per `setCameraMirrored`'s contract.
+
+  Mirroring was not involved, despite how the defect reads ("flipped both
+  horizontally and vertically" is a 180° rotation, and text in the preview stays
+  legible). Two things were checked and ruled out: `mirrorFrame` evaluates to `false`
+  on both cameras here, and the package's split of mirroring out of the EXIF value is
+  exact — `flipH ∘ rot90CCW` is the transpose (`.leftMirrored`) and `flipH ∘ rot90CW`
+  the transverse (`.rightMirrored`), so folding mirroring in changes nothing.
+
+  Only ever reachable from the background picker: `RecordScreen` drops the background
+  on the rear camera, which is also why the earlier "rotated 90°" fix was validated
+  against the front camera alone and this survived it.
+
+- **Android: the filter died on navigation and stayed dead until an app restart.**
+  The EGL context was left **current on the frame-delivery thread** after every
+  frame, and that thread is neither ours nor long-lived in the way the code assumed.
+  VisionCamera gives each `CameraFrameOutput` its own single-thread executor
+  (`HybridFrameOutput` builds an `IdentifiableExecutor` per instance) and its
+  `dispose()` only clears the analyzer — the executor is never shut down, so the
+  thread lives on idle for the life of the process, still holding the context.
+
+  An EGL context can be current on at most one thread, and `eglMakeCurrent` from a
+  second thread fails with `EGL_BAD_ACCESS` rather than stealing the binding. So the
+  moment a second camera screen mounted, its frame thread could never bind: every
+  `makeCurrent()` returned false, `renderFrame` dropped every frame at that guard,
+  and — because the renderer is a cached singleton and the dead thread never exits —
+  nothing recovered short of restarting the process.
+
+  `EglCore.releaseCurrent()` now unbinds at the end of every `renderFrame`, so no
+  thread ever holds the context between frames. Costs one extra `eglMakeCurrent` per
+  frame (and defeats `bind`'s short-circuit), which is the price of drawing on a
+  thread we do not own.
+
+- **Android: a departing `BackgroundRendererView` could destroy a live surface.**
+  Found while chasing the above, and a real fault in its own right, though not the
+  cause of it. `disconnectSurface()` meant "release whatever you are using", and the
+  renderer is a singleton shared by every view — so with two camera screens stacked
+  in a navigator (the router keeps the lower one mounted), the leaving view could
+  tear down the surface the arriving one had just connected. It now takes the surface
+  being given up and ignores anything that is not the connected one.
+
+- **Android: the filter silently did nothing in every release build** (M-003-6). A
+  `require()`d background resolved to a bare Android **resource identifier** in
+  release — `AssetSourceResolver.resourceIdentifierWithoutScale`, e.g.
+  `packages_visioncamerabackgroundfilter_src_assets_background_bgoffice` — because
+  React Native packages bundled images into `res/drawable-*` rather than shipping
+  them as files. Both Android decode paths only understood `http(s)://`, `file://`
+  and filesystem paths, so `File(uri).readBytes()` threw, the `catch → null` turned
+  that into "no background", and the shader composited the camera frame unmodified.
+  The user picked a background, watched an unfiltered preview, and uploaded an
+  unfiltered clip, with no error anywhere.
+
+  Invisible in development, which is why it survived: Metro serves an `http://` URL,
+  so a dev build has always worked. iOS is unaffected — its release assets stay real
+  files in the bundle. It hit the **live preview and the offline bake equally**, since
+  each carried its own copy of the decode.
+
+  Fixed by adding the drawable-resource branch (`Resources.getIdentifier` →
+  `openRawResource`) and moving the whole decode into one shared
+  `BackgroundImageLoader`, mirroring `ios/BackgroundImageLoader.swift` — the
+  duplication is how the branch came to be missing from both. A filesystem path is
+  still tried first, so an injected absolute path behaves exactly as before.
+
 - **Live preview was rotated 90°** (found on a real iOS device). The renderers drew
   the camera buffer 1:1, ignoring `frame.orientation` — camera buffers arrive in
   sensor orientation (landscape on a portrait phone) and VisionCamera's docs are
